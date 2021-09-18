@@ -2,3 +2,6 @@
 ET5003_SEM1_2021-2/*
 recordings/*
 .gitignore
+.ipynb_checkpoints/
+mnist_test.csv
+mnist_train.csv
