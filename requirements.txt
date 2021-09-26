@@ -1,0 +1,17 @@
+libpython
+mkl-service
+m2w64-toolchain
+numba
+python-graphviz
+scipy
+pymc3
+arviz
+matplotlib
+nb_black
+pandas
+numpy
+jupyterthemes
+scikit-learn
+scipy
+ipykernel
+tqdm
