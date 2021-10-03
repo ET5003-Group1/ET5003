@@ -1,3 +1,4 @@
+from operator import pos
 import os
 import sys
 import pandas as pd
@@ -6,9 +7,9 @@ import pymc3 as pm
 import theano as tt
 import matplotlib.pyplot as plt
 import logging
+from itertools import product
 
 # Sklearn
-import sklearn.datasets as dt
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, OrdinalEncoder
 
@@ -17,17 +18,19 @@ from datetime import datetime
 import mlflow
 from mlflow import log_metric, log_param
 
+random_seed = 11
+np.random.seed(random_seed)
 runtime = datetime.now().strftime("%Y%m%d_%H%M%S")
-mlflow.set_experiment(runtime)
 
 # Setup logging
 log_format = "%(levelname)s %(asctime)s - %(message)s"
 logging.basicConfig(
     # filename = f"logfile_{runtime}.log",
-    stream = sys.stdout,
-    filemode = "w",
-    format = log_format, 
-    level = logging.INFO)
+    stream=sys.stdout,
+    filemode="w",
+    format=log_format,
+    level=logging.INFO,
+)
 logger = logging.getLogger()
 logger.info(f"Running experiment: {runtime}")
 
@@ -68,12 +71,21 @@ def prepare_train_set(
         "price",
     ],
     target="log_price",
+    remove_outliers=False,
 ):
     column_order = NUM_COLS + ORDINAL_COLS + ONE_HOT_COLS
     processed = train_set[train_set["price"].notna()]
     processed = processed[processed["latitude"] > 53]
     processed[target] = np.log(processed["price"])
-    processed = processed.drop(columns=drop_cols).loc[:, column_order + [target]]
+    if remove_outliers:
+        processed = processed[processed["beds"]!=0]
+        processed = processed[processed["bathrooms"]!=0]
+        processed = processed[processed["surface"]<5_000]
+    processed = (
+        processed.drop(columns=drop_cols)
+        .loc[:, column_order + [target]]
+        .dropna(axis=0)  # Remove any rows with empty values
+    )
 
     X, y = (
         processed.drop(columns=target),
@@ -103,6 +115,10 @@ def prepare_test_set(
 ):
     column_order = NUM_COLS + ORDINAL_COLS + ONE_HOT_COLS
     test_set[target] = np.log(test_set["price"])
+    # if remove_outliers:
+    #     test_set = test_set[test_set["beds"]!=0]
+    #     test_set = test_set[test_set["bathrooms"]!=0]
+    #     test_set = test_set[test_set["surface"]<5_000]
     test_set = test_set.drop(columns=drop_cols).loc[:, column_order + [target]]
 
     X, y = test_set.drop(columns=target), test_set[target].copy().values.reshape(-1, 1)
@@ -173,15 +189,17 @@ def feature_sampling(X_train, X_test, features="num_only"):
     if features == "num_only":
         # Numerical features are the first ones in the dataset
         features = range(len(NUM_COLS))
+    elif features == "all":
+        features = range(X_train.shape[-1])
 
     param_feature_names = ("feat_indexes", list(features))
     log_param(*param_feature_names)
-    logging.info(f"Selecting feature indexes: {', '.join([str(idx) for idx in features])}")
-
+    logging.info(
+        f"Selecting feature indexes: {', '.join([str(idx) for idx in features])}"
+    )
 
     X_train = X_train[:, features]
     X_test = X_test[:, features]
-
     return X_train, X_test
 
 
@@ -230,12 +248,6 @@ def define_lin_reg(
     posterior : pymc3.backends.base.MultiTrace
         Posterior distribution estimated by pymc model.
     """
-    log_param(f"{model_name}_alpha", alpha)
-    log_param(f"{model_name}_beta", beta)
-    log_param(f"{model_name}_sigma", sigma)
-    log_param(f"{model_name}_n_iterations", n_iterations)
-    log_param(f"{model_name}_n_samples", n_samples)
-
     with pm.Model() as model:
         alpha = getattr(pm, alpha[0])("alpha", *alpha[1:])
         beta = getattr(pm, beta[0])("beta", *beta[1:], shape=predictors.shape[1])
@@ -244,7 +256,19 @@ def define_lin_reg(
 
         sigma = getattr(pm, sigma[0])("sigma", *sigma[1:])
         likelihood = pm.Normal("likelihood", mu=mu, sigma=sigma, observed=observed)
-        approximation = pm.fit(n_iterations, method="advi")
+        logger.info(f"Model check: {model.check_test_point()}")
+        logger.info(
+            f"\t\tThere are {np.isnan(predictors).sum()} NaNs in the predictors"
+        )
+        logger.info(
+            f"\t\tThere are {np.isnan(observed).sum()} NaNs in the observed data"
+        )
+        approximation = pm.fit(
+            n_iterations,
+            method="advi",
+            random_seed=random_seed,
+            obj_optimizer=pm.adagrad_window(learning_rate=2e-4),
+        )
         posterior = approximation.sample(n_samples)
     if plot_loss:
         plt.figure(figsize=(10, 6))
@@ -339,11 +363,12 @@ def evaluate(posterior, X, y, y_scaler, model_name, dataset_name):
     y_pred = predict(posterior, X, y_scaler)
     mae, mape_ = mean_absolute_error(y, y_pred), mape(y, y_pred)
 
-    log_metric(f"{model_name}_{dataset_name}_mae", mae)
-    log_metric(f"{model_name}_{dataset_name}_mape", mape_)
+    if dataset_name == "test":
+        log_metric(f"{model_name}_{dataset_name}_mae", mae)
+        log_metric(f"{model_name}_{dataset_name}_mape", mape_)
     logger.info(f"{model_name} metrics on {dataset_name}")
-    logger.info("\tMAE = ", mae)
-    logger.info("\tMAPE = ", mape_)
+    logger.info(f"\tMAE =  {mae}")
+    logger.info(f"\tMAPE =  {mape_}")
     return y_pred
 
 
@@ -369,8 +394,8 @@ def run_full_model(
 def gmm_clustering(X_train, lat_lon_idx=[2, 3], n_clusters=4):
     logger.info(f"Running GMM clustering with {n_clusters} clusters")
     log_param("n_clusters", n_clusters)
-    gmm = GaussianMixture(n_components=n_clusters)
-    gmm.fit(X_train)
+    gmm = GaussianMixture(n_components=n_clusters, random_state=random_seed)
+    gmm.fit(X_train[:, lat_lon_idx])
     return gmm
 
 
@@ -386,7 +411,8 @@ def prepare_clustered_data(
     if not y_scalers:
         y_scalers = [StandardScaler() for _ in range(n_clusters)]
         method = "fit_transform"
-
+    logger.info(f"\tcluster sizes {[len(cluster) for cluster in X_clusters]}")
+    logger.info(f"\t\tUsing method: {method}")
     y_clusters = [
         getattr(y_scaler, method)(y[cluster_labels == idx].reshape(-1, 1))
         for idx, y_scaler in enumerate(y_scalers)
@@ -394,12 +420,26 @@ def prepare_clustered_data(
     return X_clusters, y_clusters, y_scalers
 
 
+def piecewise_mae(posteriors, X_test_clusters, y_test_clusters, y_scalers):
+    y_preds = [
+        predict(posterior, X, y_scaler)
+        for posterior, X, y_scaler in zip(posteriors, X_test_clusters, y_scalers)
+    ]
+    # To calculate the overall MAE we need to compare the predictions for each cluster
+    # against the indexes of that cluster, then aggregate
+    mae = np.hstack([
+        abs((y_test - y_pred).ravel())
+        for y_test, y_pred in zip(y_test_clusters, y_preds)
+    ])
+
+    log_metric("piecewise_test_mae", np.mean(mae))
+
 def run_piecewise_models(
-    X_train, y_train, X_test, y_test, lat_lon_idx=[2, 3], n_clusters=4
+    X_train, y_train, X_test, y_test, lat_lon_idx=[2, 3], n_clusters=4, **model_kwargs
 ):
     gmm = gmm_clustering(X_train, lat_lon_idx, n_clusters)
-    train_cluster_labels = gmm.predict(X_train)
-    test_cluster_labels = gmm.predict(X_test)
+    train_cluster_labels = gmm.predict(X_train[:, lat_lon_idx])
+    test_cluster_labels = gmm.predict(X_test[:, lat_lon_idx])
 
     logger.info("Preparing piecewise train data")
     X_train_clusters, y_train_clusters, y_scalers = prepare_clustered_data(
@@ -412,14 +452,14 @@ def run_piecewise_models(
 
     logger.info("Calculating piecewise posteriors...")
     posteriors = [
-        define_lin_reg(X_cluster, y_cluster, f"piece_{idx}")
+        define_lin_reg(X_cluster, y_cluster.ravel(), f"piece_{idx}", **model_kwargs)
         for idx, (X_cluster, y_cluster) in enumerate(
             zip(X_train_clusters, y_train_clusters)
         )
     ]
     # Run evaluations
-    for idx in enumerate(range(n_clusters)):
-        logger.info(f"Cluster{idx}, size: {len(y_train_clusters[idx])}")
+    for idx, _ in enumerate(range(n_clusters)):
+        logger.info(f"Cluster {idx}, size: {len(y_train_clusters[idx])}")
         evaluate(
             posteriors[idx],
             X_train_clusters[idx],
@@ -436,12 +476,20 @@ def run_piecewise_models(
             f"piece_{idx}",
             "test",
         )
+    piecewise_mae(posteriors,X_test_clusters, y_test_clusters, y_scalers)
 
+def log_model(**params):
+    for key, value in params.items():
+        log_param(f"{key}", value)
 
-def main():
-    """Main function to run"""
+def run_experiment(features, remove_outliers, n_clusters, **model_kwargs):
+    """Runs an experiment"""
+    mlflow.set_experiment("base_house_price")
+    log_model(**model_kwargs)
+    log_param("remove_outliers", remove_outliers)
+
     train_set, test_set = load_datasets()
-    X_train, y_train = prepare_train_set(train_set)
+    X_train, y_train = prepare_train_set(train_set, remove_outliers=remove_outliers)
     X_test, y_test = prepare_test_set(test_set)
 
     X_train_scaled, y_train_scaled, X_transforms, y_scaler = feature_engineering(
@@ -450,11 +498,50 @@ def main():
     X_test_scaled, y_test_scaled = transform_test_set(
         X_test, y_test, X_transforms, y_scaler
     )
-    X_train_scaled, X_test_scaled = feature_sampling(X_train_scaled, X_test_scaled)
+    X_train_scaled, X_test_scaled = feature_sampling(X_train_scaled, X_test_scaled, features=features)
 
-    run_full_model(X_train_scaled, y_train_scaled, X_test_scaled, y_test_scaled, y_scaler)
-    run_piecewise_models(X_train_scaled, y_train_scaled, X_test_scaled, y_test_scaled)
+    run_full_model(
+        X_train_scaled, y_train_scaled, X_test_scaled, y_test_scaled, y_scaler
+    )
+
+    # We need to undo the scaling. The piecewise method does its own scaling
+    run_piecewise_models(
+        X_train_scaled,
+        y_scaler.inverse_transform(y_train_scaled),
+        X_test_scaled,
+        y_scaler.inverse_transform(y_test_scaled),
+        n_clusters=n_clusters,
+        **model_kwargs
+    )
     mlflow.end_run()
+
+def main():
+    """Main function to run"""
+    features = ["all", "num_only"]
+    remove_outliers = [True, False]
+    n_clusters = [3, 4, 5]
+    model_kwargs = [
+        {
+            "alpha": ("Normal", 0, 10),
+            "beta": ("Normal", 0, 10),
+            "sigma": ("HalfCauchy", 5),
+        },
+        {
+            "alpha": ("Normal", 0, 30),
+            "beta": ("Normal", 0, 30),
+            "sigma": ("HalfCauchy", 10),
+        },
+        {
+            "alpha": ("Normal", 0, 100),
+            "beta": ("Normal", 0, 100),
+            "sigma": ("HalfCauchy", 20),
+        }
+    ]
+    experiment_params = product(features, remove_outliers, n_clusters, model_kwargs)
+
+    for (feats, outliers, k, kwargs) in experiment_params:
+        run_experiment(feats, outliers, k, **kwargs)
+
 
 if __name__ == "__main__":
     main()
